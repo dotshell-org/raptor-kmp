@@ -1,6 +1,6 @@
 plugins {
     kotlin("multiplatform") version "2.1.0"
-    id("com.android.library") version "8.2.0"
+    id("com.android.library") version "9.0.0"
     id("maven-publish")
     id("signing")
     id("com.gradleup.nmcp") version "0.0.8"
@@ -23,7 +23,6 @@ kotlin {
     sourceSets {
         // commonMain holds the whole library (pure Kotlin, no platform APIs).
         // The Kotlin stdlib is added automatically for every target.
-        val commonMain by getting
     }
 }
 
@@ -54,6 +53,7 @@ publishing {
     publications.withType<MavenPublication>().configureEach {
         val pubName = name
         val emptyJavadocJar = tasks.register("${pubName}JavadocJar", Jar::class) {
+            description = "Creates an empty javadoc JAR for Maven Central publication."
             archiveClassifier.set("javadoc")
             archiveAppendix.set(pubName)
         }
@@ -67,7 +67,7 @@ publishing {
             licenses {
                 license {
                     name.set("The Apache License, Version 2.0")
-                    url.set("http://www.apache.org/licenses/LICENSE-2.0.txt")
+                    url.set("https://www.apache.org/licenses/LICENSE-2.0.txt")
                 }
             }
 
