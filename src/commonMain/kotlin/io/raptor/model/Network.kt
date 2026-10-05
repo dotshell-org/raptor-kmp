@@ -39,7 +39,7 @@ class Network(
     val routeCount: Int = routeList.size
 
     // routeId -> internal indices in routeList (multiple routes can share the same id, e.g. directions)
-    private val routeInternalIndices: HashMap<Int, IntArray> = HashMap<Int, IntArray>(routes.size * 2).also { map ->
+    internal val routeInternalIndices: HashMap<Int, IntArray> = HashMap<Int, IntArray>(routes.size * 2).also { map ->
         // First pass: count occurrences per routeId
         val counts = HashMap<Int, Int>(routes.size * 2)
         for (r in routes) {

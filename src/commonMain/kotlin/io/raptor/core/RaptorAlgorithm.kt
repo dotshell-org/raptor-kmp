@@ -23,6 +23,11 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
     // never a null check.
     private val blockedStop = BooleanArray(network.stopCount)
     private val penaltyAtStop = IntArray(network.stopCount)
+    // Edge disruptions: route-level pointers populated only for disrupted routes during a query.
+    private val routeDisruptions: Array<RouteEdgeDisruption?> = arrayOfNulls(network.routeCount)
+    private var hasEdgeDisruptions: Boolean = false
+    private val disruptedRouteIndices = IntArray(network.routeCount)
+    private var disruptedRouteCount = 0
 
     /**
      * @param accessSeconds Walk time to reach each origin stop, parallel to [originIndices]
@@ -33,6 +38,8 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
      *        time of a direct origin-to-destination walk. Never returned as a result.
      * @param stopFilter Live per-stop disruptions: stops the vehicle no longer serves, and time
      *        penalties charged for arriving at or transferring at a stop.
+     * @param edgeFilter Live edge disruptions: extra delays or cutoffs on specific route segments.
+     * @param edgePenaltyProvider Alternative provider for live edge disruptions.
      * @return best arrival at the "virtual destination" (stop arrival + its egress walk), or
      *         Int.MAX_VALUE when no transit journey beats [initialBestArrival].
      */
@@ -45,8 +52,11 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
         accessSeconds: IntArray? = null,
         egressSeconds: IntArray? = null,
         initialBestArrival: Int = Int.MAX_VALUE,
-        stopFilter: StopFilter? = null
+        stopFilter: StopFilter? = null,
+        edgeFilter: EdgeFilter? = null,
+        edgePenaltyProvider: EdgePenaltyProvider? = null
     ): Int {
+        val activeEdgeFilter = edgeFilter ?: network.buildEdgeFilter(edgePenaltyProvider = edgePenaltyProvider)
         val existing = lastState
         val state = if (existing != null && existing.maxRounds >= maxRounds) {
             existing.also { it.reset() }
@@ -72,6 +82,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             }
         }
         scatterStopFilter(stopFilter)
+        scatterEdgeFilter(activeEdgeFilter)
 
         // Pre-compute route filter bitmask (true = allowed)
         val filterBuf: BooleanArray? = if (routeFilter != null) {
@@ -147,6 +158,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             egressAtStop[idx] = 0
         }
         clearStopFilter(stopFilter)
+        clearEdgeFilter(activeEdgeFilter)
 
         if (debug) {
             if (finalBest == Int.MAX_VALUE) println("Destination not reached.")
@@ -175,6 +187,32 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
         }
     }
 
+    private fun scatterEdgeFilter(edgeFilter: EdgeFilter?) {
+        if (edgeFilter == null || edgeFilter.isEmpty) {
+            hasEdgeDisruptions = false
+            return
+        }
+        hasEdgeDisruptions = true
+        var count = 0
+        for ((routeIdx, disruption) in edgeFilter.disruptedRoutes) {
+            if (routeIdx in routeDisruptions.indices) {
+                routeDisruptions[routeIdx] = disruption
+                disruptedRouteIndices[count++] = routeIdx
+            }
+        }
+        disruptedRouteCount = count
+    }
+
+    private fun clearEdgeFilter(edgeFilter: EdgeFilter?) {
+        if (!hasEdgeDisruptions) return
+        for (i in 0 until disruptedRouteCount) {
+            val rIdx = disruptedRouteIndices[i]
+            routeDisruptions[rIdx] = null
+        }
+        disruptedRouteCount = 0
+        hasEdgeDisruptions = false
+    }
+
     private fun exploreRoutes(
         state: RaptorState,
         round: Int,
@@ -200,6 +238,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             val routeIdx = routeResultBuffer[ri]
             if (filterMask != null && !filterMask[routeIdx]) continue
             val route = network.routeList[routeIdx]
+            val edgeDisruption = if (hasEdgeDisruptions) routeDisruptions[routeIdx] else null
 
             val flat = route.flatStopTimes
             val stride = route.stopCountInRoute
@@ -208,6 +247,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             var tripOffset = 0  // currentTripIndex * stride, cached
             var boardingIndex = -1
             var boardingStopIndex = -1
+            var accumulatedEdgePenalty = 0
 
             var routeLogged = false
 
@@ -217,6 +257,18 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             for (i in stopIndicesArray.indices) {
                 val stopIndex = stopIndicesArray[i]
                 if (stopIndex == -1) continue
+
+                // Check edge traversal if we are on a trip moving from i-1 to i
+                if (edgeDisruption != null && i > 0 && currentTripIndex != -1) {
+                    val tripId = route.tripIds[currentTripIndex]
+                    if (edgeDisruption.isBlocked(i, tripId)) {
+                        currentTripIndex = -1
+                        accumulatedEdgePenalty = 0
+                    } else {
+                        accumulatedEdgePenalty += edgeDisruption.getPenalty(i, tripId)
+                    }
+                }
+
                 // Blocked stop: the vehicle runs past without serving it, so neither alighting
                 // (step 1) nor boarding (step 2) is possible here. `continue` leaves
                 // currentTripIndex intact, which is exactly the ride carrying on.
@@ -231,7 +283,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
                     // a claim about when the vehicle physically passes.
                     if (overnight && scheduled < flat[tripOffset + boardingIndex]) continue
 
-                    val arrivalTime = scheduled + penaltyAtStop[stopIndex]
+                    val arrivalTime = scheduled + accumulatedEdgePenalty + penaltyAtStop[stopIndex]
 
                     // Target pruning: can we even improve the best arrival at destination?
                     if (arrivalTime < ba[roundOff + stopIndex] && arrivalTime < currentBestAtDestination) {
@@ -268,13 +320,25 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
                     // Bounded search: only search trips [0, currentTripIndex) since
                     // FIFO guarantees only earlier trips can improve
                     val searchBound = if (currentTripIndex == -1) route.tripCount else currentTripIndex
-                    val earliestTripIdx = findEarliestTripIndex(flat, searchBound, stride, i, arrivalAtStop)
+                    var earliestTripIdx = findEarliestTripIndex(flat, searchBound, stride, i, arrivalAtStop)
+
+                    // If the trip found is blocked on the outgoing edge from this stop, it cannot carry
+                    // passengers anywhere downstream from here. Advance to the next unblocked trip.
+                    if (edgeDisruption != null && i < stride - 1 && earliestTripIdx != -1) {
+                        while (earliestTripIdx < searchBound && edgeDisruption.isBlocked(i + 1, route.tripIds[earliestTripIdx])) {
+                            earliestTripIdx++
+                        }
+                        if (earliestTripIdx >= searchBound) {
+                            earliestTripIdx = -1
+                        }
+                    }
 
                     if (earliestTripIdx != -1) {
                         currentTripIndex = earliestTripIdx
                         tripOffset = earliestTripIdx * stride
                         boardingIndex = i
                         boardingStopIndex = stopIndex
+                        accumulatedEdgePenalty = 0
                         if (debug && !routeLogged) {
                             println("  Line ${route.name}")
                             routeLogged = true
@@ -345,8 +409,11 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
         accessSeconds: IntArray? = null,
         egressSeconds: IntArray? = null,
         initialBestDeparture: Int = Int.MIN_VALUE,
-        stopFilter: StopFilter? = null
+        stopFilter: StopFilter? = null,
+        edgeFilter: EdgeFilter? = null,
+        edgePenaltyProvider: EdgePenaltyProvider? = null
     ): Int {
+        val activeEdgeFilter = edgeFilter ?: network.buildEdgeFilter(edgePenaltyProvider = edgePenaltyProvider)
         val existing = lastBackwardState
         val state = if (existing != null && existing.maxRounds >= maxRounds) {
             existing.also { it.reset() }
@@ -368,6 +435,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             }
         }
         scatterStopFilter(stopFilter)
+        scatterEdgeFilter(activeEdgeFilter)
 
         val filterBuf: BooleanArray? = if (routeFilter != null) {
             val buf = routeFilterBuffer
@@ -453,6 +521,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             accessAtStop[idx] = 0
         }
         clearStopFilter(stopFilter)
+        clearEdgeFilter(activeEdgeFilter)
 
         return bestDepartureAtOrigin
     }
@@ -480,6 +549,7 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             val routeIdx = routeResultBuffer[ri]
             if (filterMask != null && !filterMask[routeIdx]) continue
             val route = network.routeList[routeIdx]
+            val edgeDisruption = if (hasEdgeDisruptions) routeDisruptions[routeIdx] else null
 
             val flat = route.flatStopTimes
             val stride = route.stopCountInRoute
@@ -487,6 +557,8 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             var currentTripIndex = -1
             var tripOffset = 0  // currentTripIndex * stride, cached
             var alightIndex = -1  // position where we leave the current trip (mirror of boardingIndex)
+            var alightDeadline = Int.MAX_VALUE
+            var accumulatedEdgePenalty = 0
 
             val stopIndicesArray = network.routeStopIndices[routeIdx]
 
@@ -494,6 +566,40 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             for (i in stopIndicesArray.size - 1 downTo 0) {
                 val stopIndex = stopIndicesArray[i]
                 if (stopIndex == -1) continue
+
+                // Check edge traversal if we are on a trip stepping backward from i+1 to i
+                // The edge being traversed backward is i -> i+1 (which entered i+1)
+                if (edgeDisruption != null && i < stopIndicesArray.size - 1 && currentTripIndex != -1) {
+                    val tripId = route.tripIds[currentTripIndex]
+                    if (edgeDisruption.isBlocked(i + 1, tripId)) {
+                        while (currentTripIndex >= 0 && edgeDisruption.isBlocked(i + 1, route.tripIds[currentTripIndex])) {
+                            currentTripIndex--
+                        }
+                        if (currentTripIndex < 0) {
+                            currentTripIndex = -1
+                            accumulatedEdgePenalty = 0
+                        } else {
+                            tripOffset = currentTripIndex * stride
+                            accumulatedEdgePenalty += edgeDisruption.getPenalty(i + 1, route.tripIds[currentTripIndex])
+                        }
+                    } else {
+                        accumulatedEdgePenalty += edgeDisruption.getPenalty(i + 1, tripId)
+                    }
+                }
+
+                // If edge penalties cause the trip to arrive at alightIndex past alightDeadline,
+                // fall back to earlier trips that arrive on time.
+                while (currentTripIndex >= 0 && flat[tripOffset + alightIndex] + accumulatedEdgePenalty > alightDeadline) {
+                    currentTripIndex--
+                    if (currentTripIndex >= 0) {
+                        tripOffset = currentTripIndex * stride
+                    }
+                }
+                if (currentTripIndex < 0) {
+                    currentTripIndex = -1
+                    accumulatedEdgePenalty = 0
+                }
+
                 if (blockedStop[stopIndex]) continue
 
                 // 1. If we are on a trip (alighting later at alightIndex), we can depart from this
@@ -541,6 +647,8 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
                         currentTripIndex = latestTripIdx
                         tripOffset = latestTripIdx * stride
                         alightIndex = i
+                        alightDeadline = latestAtStop
+                        accumulatedEdgePenalty = 0
                     }
                 }
             }

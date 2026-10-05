@@ -1,8 +1,12 @@
 package io.raptor
 
+import io.raptor.core.EdgeFilter
+import io.raptor.core.EdgePenalty
+import io.raptor.core.EdgePenaltyProvider
 import io.raptor.core.JourneyLeg
 import io.raptor.core.LegType
 import io.raptor.core.RaptorAlgorithm
+import io.raptor.core.buildEdgeFilter
 import io.raptor.data.NetworkLoader
 import io.raptor.geo.Geo
 import io.raptor.model.Network
@@ -140,7 +144,10 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         blockedRouteIds: Set<Int> = emptySet(),
         blockedRouteNames: Set<String> = emptySet(),
         blockedStopIds: Set<Int> = emptySet(),
-        stopPenaltySeconds: Map<Int, Int> = emptyMap()
+        stopPenaltySeconds: Map<Int, Int> = emptyMap(),
+        edgePenalties: List<EdgePenalty> = emptyList(),
+        edgePenaltyProvider: EdgePenaltyProvider? = null,
+        edgePenaltyMap: Map<Pair<Int, Int>, Int>? = null
     ): List<List<JourneyLeg>> {
         val network = getCurrentNetwork()
         val originIndices = network.mapStopIdsToIndices(originStopIds)
@@ -153,8 +160,10 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         val algorithm = algorithmCache.getOrPut(currentPeriodId) { RaptorAlgorithm(network, debug = false) }
         val routeFilter = buildRouteFilter(allowedRouteIds, allowedRouteNames, blockedRouteIds, blockedRouteNames)
         val stopFilter = network.buildStopFilter(blockedStopIds, stopPenaltySeconds)
+        val edgeFilter = network.buildEdgeFilter(edgePenalties, edgePenaltyProvider, edgePenaltyMap)
         val bestArrivalAtAnyRound = algorithm.route(
-            originIndices, destinationIndices, departureTime, routeFilter, maxRounds, stopFilter = stopFilter
+            originIndices, destinationIndices, departureTime, routeFilter, maxRounds,
+            stopFilter = stopFilter, edgeFilter = edgeFilter
         )
 
         if (bestArrivalAtAnyRound == Int.MAX_VALUE) {
@@ -216,13 +225,17 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         blockedRouteNames: Set<String> = emptySet(),
         blockedStopIds: Set<Int> = emptySet(),
         stopPenaltySeconds: Map<Int, Int> = emptyMap(),
+        edgePenalties: List<EdgePenalty> = emptyList(),
+        edgePenaltyProvider: EdgePenaltyProvider? = null,
+        edgePenaltyMap: Map<Pair<Int, Int>, Int>? = null,
         directWalkSecondsOverride: Int? = null
     ): List<List<JourneyLeg>> {
         if (origin is Location.StopIds && destination is Location.StopIds) {
             return getOptimizedPaths(
                 origin.ids, destination.ids, departureTime, maxRounds,
                 allowedRouteIds, allowedRouteNames, blockedRouteIds, blockedRouteNames,
-                blockedStopIds, stopPenaltySeconds
+                blockedStopIds, stopPenaltySeconds,
+                edgePenalties, edgePenaltyProvider, edgePenaltyMap
             )
         }
 
@@ -240,11 +253,12 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         val algorithm = algorithmCache.getOrPut(currentPeriodId) { RaptorAlgorithm(network, debug = false) }
         val routeFilter = buildRouteFilter(allowedRouteIds, allowedRouteNames, blockedRouteIds, blockedRouteNames)
         val stopFilter = network.buildStopFilter(blockedStopIds, stopPenaltySeconds)
+        val edgeFilter = network.buildEdgeFilter(edgePenalties, edgePenaltyProvider, edgePenaltyMap)
         val walkArrival = directWalk?.arrivalTime ?: Int.MAX_VALUE
         val best = algorithm.route(
             o.stopIndices, d.stopIndices, departureTime, routeFilter, maxRounds,
             accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds,
-            initialBestArrival = walkArrival, stopFilter = stopFilter
+            initialBestArrival = walkArrival, stopFilter = stopFilter, edgeFilter = edgeFilter
         )
 
         val journeys = mutableListOf<List<JourneyLeg>>()
@@ -469,7 +483,10 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         blockedRouteIds: Set<Int> = emptySet(),
         blockedRouteNames: Set<String> = emptySet(),
         blockedStopIds: Set<Int> = emptySet(),
-        stopPenaltySeconds: Map<Int, Int> = emptyMap()
+        stopPenaltySeconds: Map<Int, Int> = emptyMap(),
+        edgePenalties: List<EdgePenalty> = emptyList(),
+        edgePenaltyProvider: EdgePenaltyProvider? = null,
+        edgePenaltyMap: Map<Pair<Int, Int>, Int>? = null
     ): List<List<JourneyLeg>> {
         val network = getCurrentNetwork()
         val originIndices = network.mapStopIdsToIndices(originStopIds)
@@ -483,6 +500,7 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         val earliestDeparture = maxOf(0, arrivalTime - searchWindowSeconds)
         val routeFilter = buildRouteFilter(allowedRouteIds, allowedRouteNames, blockedRouteIds, blockedRouteNames)
         val stopFilter = network.buildStopFilter(blockedStopIds, stopPenaltySeconds)
+        val edgeFilter = network.buildEdgeFilter(edgePenalties, edgePenaltyProvider, edgePenaltyMap)
         val algorithm = algorithmCache.getOrPut(currentPeriodId) { RaptorAlgorithm(network, debug = false) }
 
         // Single backward pass: a fast HINT for the latest departure that still arrives on time.
@@ -492,7 +510,7 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         // shoot (too early), or — in the extreme — a spurious Int.MIN_VALUE (misses the journey).
         val bestDeparture = algorithm.routeBackward(
             originIndices, destinationIndices, arrivalTime, earliestDeparture, routeFilter, maxRounds,
-            stopFilter = stopFilter
+            stopFilter = stopFilter, edgeFilter = edgeFilter
         )
 
         // Fast path: trust the hint only when two forward runs confirm it is exactly the latest
@@ -500,11 +518,12 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         if (bestDeparture != Int.MIN_VALUE) {
             val laterIsLate = algorithm.route(
                 originIndices, destinationIndices, bestDeparture + ARRIVE_BY_STEP_SECONDS, routeFilter, maxRounds,
-                stopFilter = stopFilter
+                stopFilter = stopFilter, edgeFilter = edgeFilter
             ) > arrivalTime
             // This run leaves the forward state at bestDeparture, ready for extraction.
             val hintArrival = algorithm.route(
-                originIndices, destinationIndices, bestDeparture, routeFilter, maxRounds, stopFilter = stopFilter
+                originIndices, destinationIndices, bestDeparture, routeFilter, maxRounds,
+                stopFilter = stopFilter, edgeFilter = edgeFilter
             )
             if (hintArrival <= arrivalTime && laterIsLate) {
                 return extractParetoJourneys(algorithm, destinationIndices, maxRounds, arrivalTime)
@@ -516,10 +535,13 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         // so it is correct no matter how the backward hint erred — including a spurious MIN.
         val departure = latestFeasibleDeparture(
             algorithm, originIndices, destinationIndices, arrivalTime, earliestDeparture, routeFilter, maxRounds,
-            stopFilter = stopFilter
+            stopFilter = stopFilter, edgeFilter = edgeFilter
         )
         if (departure == Int.MIN_VALUE) return emptyList()
-        algorithm.route(originIndices, destinationIndices, departure, routeFilter, maxRounds, stopFilter = stopFilter)
+        algorithm.route(
+            originIndices, destinationIndices, departure, routeFilter, maxRounds,
+            stopFilter = stopFilter, edgeFilter = edgeFilter
+        )
         return extractParetoJourneys(algorithm, destinationIndices, maxRounds, arrivalTime)
     }
 
@@ -540,13 +562,14 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         maxRounds: Int,
         accessSeconds: IntArray? = null,
         egressSeconds: IntArray? = null,
-        stopFilter: io.raptor.core.StopFilter? = null
+        stopFilter: io.raptor.core.StopFilter? = null,
+        edgeFilter: io.raptor.core.EdgeFilter? = null
     ): Int {
         // Monotone feasibility: the earliest departure has the most time, so if even it misses the
         // deadline nothing can — a one-run reject for genuinely infeasible queries.
         if (algorithm.route(
                 originIndices, destinationIndices, earliestDeparture, routeFilter, maxRounds,
-                accessSeconds, egressSeconds, stopFilter = stopFilter
+                accessSeconds, egressSeconds, stopFilter = stopFilter, edgeFilter = edgeFilter
             ) > arrivalTime
         ) return Int.MIN_VALUE
 
@@ -557,7 +580,7 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
             val mid = low + (high - low) / 2
             val arrival = algorithm.route(
                 originIndices, destinationIndices, mid, routeFilter, maxRounds,
-                accessSeconds, egressSeconds, stopFilter = stopFilter
+                accessSeconds, egressSeconds, stopFilter = stopFilter, edgeFilter = edgeFilter
             )
             if (arrival <= arrivalTime) {
                 best = mid
@@ -594,13 +617,17 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         blockedRouteNames: Set<String> = emptySet(),
         blockedStopIds: Set<Int> = emptySet(),
         stopPenaltySeconds: Map<Int, Int> = emptyMap(),
+        edgePenalties: List<EdgePenalty> = emptyList(),
+        edgePenaltyProvider: EdgePenaltyProvider? = null,
+        edgePenaltyMap: Map<Pair<Int, Int>, Int>? = null,
         directWalkSecondsOverride: Int? = null
     ): List<List<JourneyLeg>> {
         if (origin is Location.StopIds && destination is Location.StopIds) {
             return getOptimizedPathsArriveBy(
                 origin.ids, destination.ids, arrivalTime, maxRounds, searchWindowMinutes,
                 allowedRouteIds, allowedRouteNames, blockedRouteIds, blockedRouteNames,
-                blockedStopIds, stopPenaltySeconds
+                blockedStopIds, stopPenaltySeconds,
+                edgePenalties, edgePenaltyProvider, edgePenaltyMap
             )
         }
 
@@ -622,13 +649,14 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         val earliestDeparture = maxOf(0, arrivalTime - searchWindowSeconds)
         val routeFilter = buildRouteFilter(allowedRouteIds, allowedRouteNames, blockedRouteIds, blockedRouteNames)
         val stopFilter = network.buildStopFilter(blockedStopIds, stopPenaltySeconds)
+        val edgeFilter = network.buildEdgeFilter(edgePenalties, edgePenaltyProvider, edgePenaltyMap)
         val algorithm = algorithmCache.getOrPut(currentPeriodId) { RaptorAlgorithm(network, debug = false) }
 
         // Single backward pass: a fast HINT for the latest coordinate departure still on time.
         val bestDeparture = algorithm.routeBackward(
             o.stopIndices, d.stopIndices, arrivalTime, earliestDeparture, routeFilter, maxRounds,
             accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds,
-            initialBestDeparture = walkDeparture, stopFilter = stopFilter
+            initialBestDeparture = walkDeparture, stopFilter = stopFilter, edgeFilter = edgeFilter
         )
 
         val journeys = mutableListOf<List<JourneyLeg>>()
@@ -641,12 +669,14 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
         if (bestDeparture != Int.MIN_VALUE && bestDeparture > walkDeparture) {
             val laterIsLate = algorithm.route(
                 o.stopIndices, d.stopIndices, bestDeparture + ARRIVE_BY_STEP_SECONDS, routeFilter, maxRounds,
-                accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds, stopFilter = stopFilter
+                accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds,
+                stopFilter = stopFilter, edgeFilter = edgeFilter
             ) > arrivalTime
             // Leaves the forward state at bestDeparture, ready for extraction on the fast path.
             val hintArrival = algorithm.route(
                 o.stopIndices, d.stopIndices, bestDeparture, routeFilter, maxRounds,
-                accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds, stopFilter = stopFilter
+                accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds,
+                stopFilter = stopFilter, edgeFilter = edgeFilter
             )
             if (hintArrival <= arrivalTime && laterIsLate) transitDeparture = bestDeparture
         }
@@ -655,12 +685,14 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
             // early, or a spurious MIN / one that failed to beat the walk).
             val found = latestFeasibleDeparture(
                 algorithm, o.stopIndices, d.stopIndices, arrivalTime, earliestDeparture, routeFilter, maxRounds,
-                accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds, stopFilter = stopFilter
+                accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds,
+                stopFilter = stopFilter, edgeFilter = edgeFilter
             )
             if (found != Int.MIN_VALUE) {
                 algorithm.route(
                     o.stopIndices, d.stopIndices, found, routeFilter, maxRounds,
-                    accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds, stopFilter = stopFilter
+                    accessSeconds = o.walkSeconds, egressSeconds = d.walkSeconds,
+                    stopFilter = stopFilter, edgeFilter = edgeFilter
                 )
                 transitDeparture = found
             }
