@@ -22,7 +22,13 @@ object SyntheticNetworkBuilder {
      * @param trips one IntArray of stop times per trip, parallel to [stopIds]. Trips must be
      *        sorted by time at every stop position (FIFO), as the loader guarantees for real data.
      */
-    fun route(id: Int, name: String, stopIds: IntArray, trips: List<IntArray>): Route {
+    fun route(
+        id: Int,
+        name: String,
+        stopIds: IntArray,
+        trips: List<IntArray>,
+        tripIds: IntArray? = null
+    ): Route {
         val stopCount = stopIds.size
         val flat = IntArray(trips.size * stopCount)
         for (t in trips.indices) {
@@ -35,7 +41,9 @@ object SyntheticNetworkBuilder {
                 if (row[i] < row[i - 1]) overnight = true
             }
         }
-        return Route(id, name, stopIds, trips.size, stopCount, flat, IntArray(trips.size) { it }, overnight)
+        val actualTripIds = tripIds ?: IntArray(trips.size) { it }
+        require(actualTripIds.size == trips.size) { "tripIds size must match trips count" }
+        return Route(id, name, stopIds, trips.size, stopCount, flat, actualTripIds, overnight)
     }
 
     /**
