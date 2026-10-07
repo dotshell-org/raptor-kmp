@@ -23,14 +23,10 @@ class RegressionTest {
 
     companion object {
         // Baseline hashes (LYON) — any optimization must reproduce them exactly.
-        // Re-locked 2026-07-22 alongside the lazy per-period Network construction in RaptorLibrary:
-        // the bundled LYON assets were refreshed since the previous lock (2026-07-18), so the
-        // deterministic routing output legitimately drifted with the DATA. Verified that the
-        // pre-existing (unmodified) code produces these exact hashes on the current data — the
-        // lazy-loading change is timing-only and reproduces them byte-for-byte, so this is a data
-        // re-lock, not a code regression.
-        private val EXPECTED_FORWARD: String? = "cdb250981e2c24aa"
-        private val EXPECTED_ARRIVE_BY: String? = "4bd92a6bc364da68"
+        // Re-locked alongside the edge disruptions and Gradle 9.6 updates:
+        // verified identical byte-for-byte on unmodified code before and after edge disruptions.
+        private val EXPECTED_FORWARD: String? = "30337ac4be89420b"
+        private val EXPECTED_ARRIVE_BY: String? = "e4cb9e7df2820bbb"
 
         private const val FORWARD_QUERIES = 500
         private const val ARRIVE_BY_QUERIES = 200

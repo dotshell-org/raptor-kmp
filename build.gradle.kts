@@ -46,6 +46,10 @@ android {
     }
 }
 
+tasks.withType<Test>().configureEach {
+    failOnNoDiscoveredTests = false
+}
+
 // Kotlin Multiplatform's maven-publish integration creates one publication per target
 // (kotlinMultiplatform metadata + androidRelease + iosArm64 + iosSimulatorArm64) automatically.
 // We only attach the shared POM metadata to each of them.

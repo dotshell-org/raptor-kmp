@@ -93,3 +93,5 @@ registerJmhRun("jmhNamedParis", "io.raptor.benchmark.NamedRoutesParisBenchmark.*
 registerJmhRun("jmhAggregateParis", "io.raptor.benchmark.RaptorBenchmark.*", "3g", listOf("-p", "dataset=PARIS"))
 // findNearbyStops: spatial grid vs the old brute-force scan, on the IDFM (Paris) stop set
 registerJmhRun("jmhNearbyParis", "io.raptor.benchmark.NearbyStopsBenchmark.*", "2g")
+// Dynamic edge penalties and segment blacklisting latency benchmark (RFC 0001 / Issue #11)
+registerJmhRun("jmhEdgeFilter", "io.raptor.benchmark.EdgeFilterBenchmark.*", "1g")
