@@ -11,7 +11,10 @@
       "Bash(xargs:*)",
       "Bash(./gradlew:*)",
       "Bash(grep -r \"jmh\\\\|JMH\\\\|benchmark\\\\|Benchmark\" /z/Projets/raptor-kt/build.gradle*)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "Bash(find \"Z:/Projets/raptor-kmp\" -type d -not -path '*/\\\\.git/*' -not -path '*/build/*' -not -path '*/.kotlin/*' -not -path '*/.gradle/*' | head -80)",
+      "Bash(./gradlew :benchmark:test --console=plain)",
+      "Bash(xargs grep -o 'tests=\"[0-9]*\" skipped=\"[0-9]*\" failures=\"[0-9]*\" errors=\"[0-9]*\" [^>]*time=\"[0-9.]*\"')"
     ]
   }
 }
