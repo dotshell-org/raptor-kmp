@@ -4,6 +4,9 @@
 # Project
 android.useAndroidX=true
 android.enableJetifier=false
+# AGP 9 with the Kotlin Multiplatform plugin: keep Kotlin and the DSL as KMP expects them
+android.builtInKotlin=false
+android.newDsl=false
 
 # Signing
 signing.keyId=XXXXXXXXX

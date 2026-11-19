@@ -10,7 +10,7 @@ Add to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("eu.dotshell:raptor-kmp:2.1.0")
+    implementation("eu.dotshell:raptor-kmp:2.4.0")
 }
 ```
 
@@ -78,6 +78,31 @@ val journeys = raptor.getOptimizedPaths(
 // Get current active period
 val currentPeriod = raptor.getCurrentPeriod() // Returns: "summer"
 ```
+
+### Small Heaps (v2.4.0)
+
+On a phone, keep only the selected period in memory and read each period's files only when it is
+selected:
+
+```kotlin
+val raptor = RaptorLibrary(listOf(
+    PeriodData("weekday", { assets.open("weekday/stops.bin").readBytes() }, { assets.open("weekday/routes.bin").readBytes() }),
+    PeriodData("saturday", { assets.open("saturday/stops.bin").readBytes() }, { assets.open("saturday/routes.bin").readBytes() }),
+    PeriodData("sunday", { assets.open("sunday/stops.bin").readBytes() }, { assets.open("sunday/routes.bin").readBytes() })
+), keepAllPeriods = false)
+
+raptor.setPeriod("saturday")   // drops the weekday network, then builds the Saturday one
+
+// When the app goes to the background: free the search buffers (rebuilt on the next search)
+raptor.releaseSearchState()
+```
+
+With `keepAllPeriods = true` (the default, as before) every period stays built once selected. In
+both modes the files' bytes are let go as soon as a period's network is built.
+
+Since 2.4.0 the network itself is held in flat arrays: on a whole-France network (313 419 stops,
+489 575 trips) the heap after loading went from 275 MB to 124 MB, and the smallest JVM heap that
+loads it and runs searches from 384 MB to 224 MB, with identical journeys.
 
 ### Arrive-By Search
 
