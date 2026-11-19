@@ -47,43 +47,74 @@ class PeriodData(
  * ))
  * ```
  */
-class RaptorLibrary(periodDataList: List<PeriodData>) {
-    // Each period's Network is built lazily on first access, so cold start only pays for the
-    // active period; the other periods (e.g. weekend/holiday schedules) are read from their
-    // providers and indexed only when they are actually selected via [setPeriod] or queried.
-    private val networks: Map<String, Lazy<Network>>
+class RaptorLibrary(periodDataList: List<PeriodData>, private val keepAllPeriods: Boolean) {
+    // Each period's Network is built on first access, so cold start only pays for the active
+    // period; the other periods (e.g. weekend/holiday schedules) are read from their providers
+    // and indexed only when they are actually selected via [setPeriod] or queried.
+    //
+    // keepAllPeriods = true (the default): a built network stays, and its PeriodData is let go
+    // at once, so bytes captured by the eager constructor are freed after the build.
+    // keepAllPeriods = false: one network at a time. Building a period first lets the previous
+    // one (and its search state) go, so the heap never holds two; a period built again calls its
+    // providers again, so give providers that read the files rather than captured bytes.
+    private val providers = LinkedHashMap<String, PeriodData?>()
+    private val networks = HashMap<String, Network>()
     private val algorithmCache = mutableMapOf<String, RaptorAlgorithm>()
     private var currentPeriodId: String
 
     init {
         require(periodDataList.isNotEmpty()) { "At least one period data must be provided" }
-
-        networks = periodDataList.associate { periodData ->
-            periodData.periodId to lazy {
-                val stops = NetworkLoader.loadStops(periodData.stopsProvider())
-                val routes = NetworkLoader.loadRoutes(periodData.routesProvider())
-                Network(stops, routes)
-            }
-        }
+        for (periodData in periodDataList) providers[periodData.periodId] = periodData
 
         // Par défaut, utilise la première période
         currentPeriodId = periodDataList.first().periodId
     }
-    
+
+    /** Every period kept once built (the behaviour of earlier versions). */
+    constructor(periodDataList: List<PeriodData>) : this(periodDataList, keepAllPeriods = true)
+
     /**
      * Alternative constructor for single period (backward compatibility)
      */
     constructor(stopsBytes: ByteArray, routesBytes: ByteArray) : this(
         listOf(PeriodData("default", stopsBytes, routesBytes))
     )
-    
+
+    /** The network of [periodId], built on first access; null for an unknown period. */
+    private fun network(periodId: String): Network? {
+        networks[periodId]?.let { return it }
+        if (!providers.containsKey(periodId)) return null
+        val data = providers[periodId] ?: error("period $periodId was built and let go")
+        if (!keepAllPeriods) {
+            networks.clear()
+            algorithmCache.clear()
+        }
+        // One file's bytes at a time: the stops bytes are garbage before the routes are read.
+        val stops = NetworkLoader.loadStops(data.stopsProvider())
+        val routes = NetworkLoader.loadRoutes(data.routesProvider())
+        val network = Network(stops, routes)
+        networks[periodId] = network
+        if (keepAllPeriods) providers[periodId] = null
+        return network
+    }
+
+    /**
+     * Lets go of the search states (labels for every stop and round, tens of MB on a large
+     * network), forward and arrive-by, of every period. The next search allocates them again,
+     * sized to its own round limit. For an app going to the background, or before a search with
+     * a much lower round limit.
+     */
+    fun releaseSearchState() {
+        for (algorithm in algorithmCache.values) algorithm.releaseState()
+    }
+
     /**
      * Sets the active period for route calculations
      * @param periodId The identifier of the period to use
      * @return true if the period was found and set, false otherwise
      */
     fun setPeriod(periodId: String): Boolean {
-        return if (networks.containsKey(periodId)) {
+        return if (providers.containsKey(periodId)) {
             currentPeriodId = periodId
             true
         } else {
@@ -99,7 +130,7 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
     /**
      * Gets all available period identifiers
      */
-    fun getAvailablePeriods(): Set<String> = networks.keys
+    fun getAvailablePeriods(): Set<String> = providers.keys
 
     /**
      * Parsed routes of [periodId]. Triggers the (lazy) build of that period's network on first
@@ -107,19 +138,19 @@ class RaptorLibrary(periodDataList: List<PeriodData>) {
      * already-parsed data instead of re-parsing the `.bin` bytes themselves.
      */
     fun getRoutes(periodId: String): List<Route> =
-        networks[periodId]?.value?.routeList?.toList() ?: emptyList()
+        network(periodId)?.routeList?.toList() ?: emptyList()
 
     /**
      * Parsed stops of [periodId]. Triggers the (lazy) build of that period's network on first
      * access, and returns an empty list if the period is unknown.
      */
     fun getStops(periodId: String): List<Stop> =
-        networks[periodId]?.value?.stops ?: emptyList()
+        network(periodId)?.stops ?: emptyList()
 
     /**
      * Gets the network for the current period
      */
-    private fun getCurrentNetwork(): Network = networks[currentPeriodId]!!.value
+    private fun getCurrentNetwork(): Network = network(currentPeriodId)!!
 
     /**
      * Searches for optimized paths between stop identifiers.

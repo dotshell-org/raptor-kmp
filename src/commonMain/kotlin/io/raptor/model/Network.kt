@@ -66,6 +66,11 @@ class Network(
     val routeList: Array<Route> = routes.toTypedArray()
     val routeCount: Int = routeList.size
 
+    init {
+        // The search state packs boarding and alighting positions in 16 bits each.
+        for (r in routeList) require(r.stopCountInRoute < 65536) { "route ${r.id} has ${r.stopCountInRoute} stops (max 65535)" }
+    }
+
     // routeId -> internal indices in routeList (multiple routes can share the same id, e.g.
     // directions). Built on first use: only edge penalties need it after construction.
     internal val routeInternalIndices: HashMap<Int, IntArray> by lazy { buildRouteInternalIndices(routeList) }

@@ -6,6 +6,12 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
     private var lastState: RaptorState? = null
     private var lastBackwardState: BackwardRaptorState? = null
 
+    /** Lets go of the search states; the next search allocates one of its own size. */
+    fun releaseState() {
+        lastState = null
+        lastBackwardState = null
+    }
+
     // Reusable buffers for route collection (avoid allocations per round)
     private val routeSeenBuffer = BooleanArray(network.routeCount)
     private val routeResultBuffer = IntArray(network.routeCount)
@@ -57,10 +63,13 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
         edgePenaltyProvider: EdgePenaltyProvider? = null
     ): Int {
         val activeEdgeFilter = edgeFilter ?: network.buildEdgeFilter(edgePenaltyProvider = edgePenaltyProvider)
+        // Reused only at the same round limit: a bigger state would run (and keep) more rounds
+        // than asked, a smaller one cannot hold them. The old one is let go before allocating.
         val existing = lastState
-        val state = if (existing != null && existing.maxRounds >= maxRounds) {
+        val state = if (existing != null && existing.maxRounds == maxRounds) {
             existing.also { it.reset() }
         } else {
+            lastState = null
             RaptorState(network, maxRounds = maxRounds)
         }
         lastState = state
@@ -415,9 +424,10 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
     ): Int {
         val activeEdgeFilter = edgeFilter ?: network.buildEdgeFilter(edgePenaltyProvider = edgePenaltyProvider)
         val existing = lastBackwardState
-        val state = if (existing != null && existing.maxRounds >= maxRounds) {
+        val state = if (existing != null && existing.maxRounds == maxRounds) {
             existing.also { it.reset() }
         } else {
+            lastBackwardState = null
             BackwardRaptorState(network, maxRounds)
         }
         lastBackwardState = state

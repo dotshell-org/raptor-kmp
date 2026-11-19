@@ -44,19 +44,21 @@ class RaptorState(val network: Network, val maxRounds: Int) {
     val bestArrival: IntArray = IntArray((maxRounds + 1) * stopCount).also { it.fill(Int.MAX_VALUE) }
 
     // Parent tracking: flat interleaved IntArray
-    // Layout: parentData[(round * stopCount + stopIndex) * 7 + field]
-    // 7 fields per entry, all in one contiguous array for cache locality
+    // Layout: parentData[(round * stopCount + stopIndex) * 4 + field], 4 ints per entry:
+    //   P_STOP   the stop the leg comes from (-1: no parent)
+    //   P_ROUTE  internal route index of a ride, -1 for a walk
+    //   P_DATA   a ride's trip index in the route; a walk's departure time
+    //   P_POS    a ride's boarding and alighting positions in the route, 16 bits each
+    // What 2.3 stored besides is derived: the parent round (round - 1 after a ride, the same
+    // round after a walk) and a ride's departure (its trip's time at the boarding position).
     val parentData: IntArray = IntArray((maxRounds + 1) * stopCount * PARENT_STRIDE).also { it.fill(-1) }
 
     companion object {
         const val P_STOP = 0
-        const val P_ROUND = 1
-        const val P_ROUTE = 2
-        const val P_DEP_TIME = 3
-        const val P_TRIP = 4
-        const val P_BOARD_POS = 5
-        const val P_ALIGHT_POS = 6
-        const val PARENT_STRIDE = 7
+        const val P_ROUTE = 1
+        const val P_DATA = 2
+        const val P_POS = 3
+        const val PARENT_STRIDE = 4
     }
 
     // Boolean arrays for O(1) mark checks (var: swapped in clearMarks to avoid O(stopCount) copies)
@@ -163,8 +165,9 @@ class RaptorState(val network: Network, val maxRounds: Int) {
     }
 
     /**
-     * Sets parent info for a stop in a given round (interleaved flat array write).
-     * All 7 fields are written to contiguous memory for cache locality.
+     * Sets parent info for a stop in a given round (interleaved flat array write). The
+     * signature is that of 2.3; [pRound] and a ride's [depTime] are not stored but derived
+     * (see the layout above), so the callers stay as they were.
      */
     fun setParent(
         round: Int, stopIndex: Int,
@@ -174,12 +177,14 @@ class RaptorState(val network: Network, val maxRounds: Int) {
         if (round > lastMaxRound) lastMaxRound = round
         val base = (round * stopCount + stopIndex) * PARENT_STRIDE
         parentData[base + P_STOP] = pStopIndex
-        parentData[base + P_ROUND] = pRound
         parentData[base + P_ROUTE] = routeIdx
-        parentData[base + P_DEP_TIME] = depTime
-        parentData[base + P_TRIP] = tripIdx
-        parentData[base + P_BOARD_POS] = boardingPos
-        parentData[base + P_ALIGHT_POS] = alightingPos
+        if (routeIdx == -1) {
+            parentData[base + P_DATA] = depTime
+            parentData[base + P_POS] = -1
+        } else {
+            parentData[base + P_DATA] = tripIdx
+            parentData[base + P_POS] = (boardingPos shl 16) or (alightingPos and 0xFFFF)
+        }
     }
 
     fun reconstructJourney(destinationIndex: Int, round: Int? = null): List<JourneyLeg> {
@@ -197,12 +202,17 @@ class RaptorState(val network: Network, val maxRounds: Int) {
             val pStop = parentData[base + P_STOP]
             if (pStop == -1) break
 
-            val pRound = parentData[base + P_ROUND]
             val pRouteInternalIdx = parentData[base + P_ROUTE]
-            val pDepTime = parentData[base + P_DEP_TIME]
-            val pTripIdx = parentData[base + P_TRIP]
-            val pBoardingPos = parentData[base + P_BOARD_POS]
-            val pAlightingPos = parentData[base + P_ALIGHT_POS]
+            val ride = pRouteInternalIdx != -1
+            val pRound = if (ride) currentRound - 1 else currentRound
+            val pTripIdx = if (ride) parentData[base + P_DATA] else -1
+            val positions = parentData[base + P_POS]
+            val pBoardingPos = if (ride) positions ushr 16 else -1
+            val pAlightingPos = if (ride) positions and 0xFFFF else -1
+            val pDepTime = if (ride) {
+                val route = network.routeList[pRouteInternalIdx]
+                route.flatStopTimes[pTripIdx * route.stopCountInRoute + pBoardingPos]
+            } else parentData[base + P_DATA]
 
             val intermediateStopIndices = mutableListOf<Int>()
             val intermediateArrivalTimes = mutableListOf<Int>()
