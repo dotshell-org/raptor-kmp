@@ -19,7 +19,24 @@ private const val CELL_SIZE_METERS = 500.0
 class NearbyStop(val stopIndex: Int, val distanceMeters: Double)
 
 /**
+ * Compressed adjacency (CSR): the values of row `i` are `data[start[i] until start[i + 1]]`.
+ * One array of offsets and one of values for the whole network, instead of one array per row:
+ * no object header per stop, and nothing allocated for an empty row.
+ */
+internal class Adjacency(val start: IntArray, val data: IntArray) {
+    fun row(i: Int): IntArray = data.copyOfRange(start[i], start[i + 1])
+}
+
+/**
  * A container holding all network data for the router.
+ *
+ * Memory layout (2.4.0): the search reads flat arrays only. Transfers, routes per stop and
+ * same-name groups are each one [Adjacency]; the per-stop arrays of earlier versions
+ * ([transferData], [reverseTransferData], [routeIndicesForStop], [implicitTransferData],
+ * [stopsByName]) are still there for callers, built on first access from the flat arrays, so a
+ * network that is only routed on never holds them. When stop ids are their own positions (what
+ * raptor-gtfs-pipeline writes), there is no id -> index map at all, and the transfers read from
+ * a stops.bin are routed on in the very array [io.raptor.data.NetworkLoader] filled.
  */
 class Network(
     val stops: List<Stop>,
@@ -28,130 +45,194 @@ class Network(
     // Total number of stops in the network
     val stopCount: Int = stops.size
 
-    // Quick access: stopId -> index in stops list (O(1) lookup)
-    private val stopIdToIndex: HashMap<Int, Int> = HashMap<Int, Int>(stops.size * 2).also { map ->
-        for (i in stops.indices) {
-            map[stops[i].id] = i
-        }
+    // Stop ids are positions (0..n-1) in pipeline output: then an id is its own index.
+    private val identityIds: Boolean = run {
+        for (i in stops.indices) if (stops[i].id != i) return@run false
+        true
     }
+
+    // Otherwise: stopId -> index in stops list (O(1) lookup)
+    private val stopIdToIndex: HashMap<Int, Int>? = if (identityIds) null else
+        HashMap<Int, Int>(stops.size * 2).also { map ->
+            for (i in stops.indices) {
+                map[stops[i].id] = i
+            }
+        }
+
+    fun getStopIndex(id: Int): Int =
+        if (identityIds) (if (id in 0 until stopCount) id else -1) else stopIdToIndex!![id] ?: -1
+
     // Routes indexed by internal position (0..routeCount-1)
     val routeList: Array<Route> = routes.toTypedArray()
     val routeCount: Int = routeList.size
 
-    // routeId -> internal indices in routeList (multiple routes can share the same id, e.g. directions)
-    internal val routeInternalIndices: HashMap<Int, IntArray> = HashMap<Int, IntArray>(routes.size * 2).also { map ->
-        // First pass: count occurrences per routeId
-        val counts = HashMap<Int, Int>(routes.size * 2)
-        for (r in routes) {
-            counts[r.id] = (counts[r.id] ?: 0) + 1
-        }
-        // Allocate arrays and fill
-        val offsets = HashMap<Int, Int>(routes.size * 2)
-        for ((id, count) in counts) {
-            map[id] = IntArray(count)
-            offsets[id] = 0
-        }
-        for (i in routes.indices) {
-            val id = routes[i].id
-            val arr = map[id]!!
-            arr[offsets[id]!!] = i
-            offsets[id] = offsets[id]!! + 1
-        }
-    }
+    // routeId -> internal indices in routeList (multiple routes can share the same id, e.g.
+    // directions). Built on first use: only edge penalties need it after construction.
+    internal val routeInternalIndices: HashMap<Int, IntArray> by lazy { buildRouteInternalIndices(routeList) }
 
-    // Pre-computed: routeStopIndices[routeInternalIdx][posInRoute] = global stopIndex
+    // Pre-computed: routeStopIndices[routeInternalIdx][posInRoute] = global stopIndex. With ids
+    // that are indices, the route's own stopIds array already is that row: it is shared.
     val routeStopIndices: Array<IntArray> = Array(routeList.size) { r ->
         val stopIds = routeList[r].stopIds
-        IntArray(stopIds.size) { i -> stopIdToIndex[stopIds[i]] ?: -1 }
+        if (identityIds && stopIds.all { it in 0 until stopCount }) stopIds
+        else IntArray(stopIds.size) { i -> getStopIndex(stopIds[i]) }
     }
+
+    // Explicit transfers: row = stop index, values = [targetIdx0, walkTime0, targetIdx1, ...]
+    internal val transfers: Adjacency = buildTransfers()
+
+    // Incoming transfers (arrive-by): exact transpose, built on the first backward search.
+    internal val reverseTransfers: Adjacency by lazy { transposeTransfers() }
+
+    // Internal route indices serving each stop (only where the stop appears in that direction).
+    internal val stopRoutes: Adjacency = buildStopRoutes()
+
+    // Same-name groups: implicitGroupOf[stopIndex] = group, members ascending by stop index.
+    internal val implicitGroupOf: IntArray
+    internal val implicitGroups: Adjacency
+
+    init {
+        val groupOfName = HashMap<String, Int>()
+        val groupOf = IntArray(stopCount)
+        val sizes = ArrayList<Int>()
+        for (si in stops.indices) {
+            val g = groupOfName.getOrPut(stops[si].name) { sizes.add(0); sizes.size - 1 }
+            groupOf[si] = g
+            sizes[g] = sizes[g] + 1
+        }
+        val start = IntArray(sizes.size + 1)
+        for (g in sizes.indices) start[g + 1] = start[g] + sizes[g]
+        val members = IntArray(stopCount)
+        val fill = start.copyOf(sizes.size)
+        for (si in stops.indices) members[fill[groupOf[si]]++] = si
+        implicitGroupOf = groupOf
+        implicitGroups = Adjacency(start, members)
+    }
+
+    // ── per-stop views, for callers: built on first access ──────────────────────────────
 
     // Pre-computed transfer data: transferData[stopIndex] = [targetIdx0, walkTime0, targetIdx1, walkTime1, ...]
-    val transferData: Array<IntArray> = Array(stops.size) { si ->
-        val transfers = stops[si].transfers
-        val arr = IntArray(transfers.size * 2)
-        for (t in transfers.indices) {
-            arr[t * 2] = stopIdToIndex[transfers[t].targetStopId] ?: -1
-            arr[t * 2 + 1] = transfers[t].walkTime
-        }
-        arr
-    }
+    val transferData: Array<IntArray> by lazy { Array(stopCount) { transfers.row(it) } }
 
     // Reverse adjacency of transferData: reverseTransferData[stopIndex] = [sourceIdx0, walkTime0, ...]
-    // lists every explicit transfer arriving AT this stop. GTFS transfers can be asymmetric, so the
-    // backward (arrive-by) search needs incoming arcs; built as an exact transpose in two passes.
-    val reverseTransferData: Array<IntArray> = run {
-        val counts = IntArray(stops.size)
+    val reverseTransferData: Array<IntArray> by lazy { Array(stopCount) { reverseTransfers.row(it) } }
+
+    // routeIndicesForStop[stopIndex] = array of internal route indices
+    val routeIndicesForStop: Array<IntArray> by lazy { Array(stopCount) { stopRoutes.row(it) } }
+
+    // Index stops by name for implicit transfers
+    val stopsByName: Map<String, List<Int>> by lazy { stops.indices.groupBy { stops[it].name } }
+
+    // implicitTransferData[stopIndex] = IntArray of other stop indices with same name
+    val implicitTransferData: Array<IntArray> by lazy {
+        Array(stopCount) { si ->
+            val g = implicitGroupOf[si]
+            val from = implicitGroups.start[g]
+            val to = implicitGroups.start[g + 1]
+            IntArray(to - from - 1).also { out ->
+                var c = 0
+                for (m in from until to) if (implicitGroups.data[m] != si) out[c++] = implicitGroups.data[m]
+            }
+        }
+    }
+
+    // ── construction ─────────────────────────────────────────────────────────────────────
+
+    private fun buildTransfers(): Adjacency {
+        val start = IntArray(stopCount + 1)
+        for (si in stops.indices) start[si + 1] = start[si] + stops[si].transfers.size * 2
+        val total = start[stopCount]
+        // Fast path: transfers read from a stops.bin share one array, laid out stop after stop.
+        // With ids that are indices and every target in range, that array is the adjacency.
+        var shared: IntArray? = null
+        var reusable = identityIds
         for (si in stops.indices) {
-            val arr = transferData[si]
+            if (!reusable) break
+            val list = stops[si].transfers
+            if (list.isEmpty()) continue
+            if (list !is FlatTransferList || list.start != start[si] || (shared != null && list.pairs !== shared)) {
+                reusable = false
+            } else {
+                shared = list.pairs
+            }
+        }
+        if (reusable && shared != null && shared.size == total) {
             var t = 0
-            while (t < arr.size) {
-                val target = arr[t]
-                if (target != -1) counts[target] += 2
+            while (t < total) {
+                if (shared[t] !in 0 until stopCount) { reusable = false; break }
+                t += 2
+            }
+            if (reusable) return Adjacency(start, shared)
+        }
+        val data = IntArray(total)
+        for (si in stops.indices) {
+            var at = start[si]
+            for (transfer in stops[si].transfers) {
+                data[at] = getStopIndex(transfer.targetStopId)
+                data[at + 1] = transfer.walkTime
+                at += 2
+            }
+        }
+        return Adjacency(start, data)
+    }
+
+    private fun transposeTransfers(): Adjacency {
+        val start = IntArray(stopCount + 1)
+        val data = transfers.data
+        for (si in 0 until stopCount) {
+            var t = transfers.start[si]
+            val end = transfers.start[si + 1]
+            while (t < end) {
+                val target = data[t]
+                if (target != -1) start[target + 1] += 2
                 t += 2
             }
         }
-        val result = Array(stops.size) { IntArray(counts[it]) }
-        val fill = IntArray(stops.size)
-        for (si in stops.indices) {
-            val arr = transferData[si]
-            var t = 0
-            while (t < arr.size) {
-                val target = arr[t]
-                val walk = arr[t + 1]
+        for (i in 0 until stopCount) start[i + 1] += start[i]
+        val out = IntArray(start[stopCount])
+        val fill = start.copyOf(stopCount)
+        for (si in 0 until stopCount) {
+            var t = transfers.start[si]
+            val end = transfers.start[si + 1]
+            while (t < end) {
+                val target = data[t]
+                val walk = data[t + 1]
                 t += 2
                 if (target == -1) continue
-                val out = result[target]
                 val pos = fill[target]
                 out[pos] = si
                 out[pos + 1] = walk
                 fill[target] = pos + 2
             }
         }
-        result
+        return Adjacency(start, out)
     }
 
-    // Pre-computed: routeIndicesForStop[stopIndex] = array of internal route indices
-    // Filtered: only includes routes where the stop actually appears in routeStopIndices
-    val routeIndicesForStop: Array<IntArray> = Array(stops.size) { si ->
-        val routeIds = stops[si].routeIds
-        var total = 0
-        for (rid in routeIds) {
-            total += routeInternalIndices[rid]?.size ?: 0
-        }
-        val indices = IntArray(total)
-        var count = 0
-        for (rid in routeIds) {
-            val arr = routeInternalIndices[rid] ?: continue
-            for (rIdx in arr) {
-                // Only include if stop actually appears in this route direction
-                val rsi = routeStopIndices[rIdx]
-                var found = false
-                for (p in rsi.indices) {
-                    if (rsi[p] == si) { found = true; break }
-                }
-                if (found) {
-                    indices[count++] = rIdx
+    private fun buildStopRoutes(): Adjacency {
+        val internal = buildRouteInternalIndices(routeList)
+        val start = IntArray(stopCount + 1)
+        var data = IntArray(maxOf(16, stopCount * 4))
+        var used = 0
+        for (si in stops.indices) {
+            for (rid in stops[si].routeIds) {
+                val arr = internal[rid] ?: continue
+                for (rIdx in arr) {
+                    // Only include if stop actually appears in this route direction
+                    val rsi = routeStopIndices[rIdx]
+                    var found = false
+                    for (p in rsi.indices) {
+                        if (rsi[p] == si) { found = true; break }
+                    }
+                    if (found) {
+                        if (used == data.size) data = data.copyOf(data.size * 2)
+                        data[used++] = rIdx
+                    }
                 }
             }
+            start[si + 1] = used
         }
-        if (count == total) indices else indices.copyOf(count)
+        return Adjacency(start, if (used == data.size) data else data.copyOf(used))
     }
-
-    // Index stops by name for implicit transfers
-    val stopsByName: Map<String, List<Int>> = stops.indices.groupBy { stops[it].name }
-
-    // Pre-computed implicit transfer data: implicitTransferData[stopIndex] = IntArray of other stop indices with same name
-    val implicitTransferData: Array<IntArray> = Array(stops.size) { si ->
-        val sameNameStops = stopsByName[stops[si].name] ?: emptyList()
-        val filtered = IntArray(sameNameStops.size - 1)
-        var count = 0
-        for (idx in sameNameStops) {
-            if (idx != si) filtered[count++] = idx
-        }
-        if (count == filtered.size) filtered else filtered.copyOf(count)
-    }
-
-    fun getStopIndex(id: Int): Int = stopIdToIndex[id] ?: -1
 
     // Built lazily on the first walking query, so networks that never take an address query pay
     // nothing (mirrors the engine's lazy per-period construction).
@@ -173,10 +254,14 @@ class Network(
      */
     fun collectRouteIndices(stopIndices: IntArray, stopCount: Int, seenBuffer: BooleanArray, resultBuffer: IntArray): Int {
         var count = 0
+        val start = stopRoutes.start
+        val data = stopRoutes.data
         for (idx in 0 until stopCount) {
             val si = stopIndices[idx]
-            val routeIndices = routeIndicesForStop[si]
-            for (routeIdx in routeIndices) {
+            var p = start[si]
+            val end = start[si + 1]
+            while (p < end) {
+                val routeIdx = data[p++]
                 if (!seenBuffer[routeIdx]) {
                     seenBuffer[routeIdx] = true
                     resultBuffer[count++] = routeIdx
@@ -189,6 +274,27 @@ class Network(
         }
         return count
     }
+}
+
+/** routeId -> internal indices, in route order (several directions share an id). */
+private fun buildRouteInternalIndices(routes: Array<Route>): HashMap<Int, IntArray> {
+    val counts = HashMap<Int, Int>(routes.size * 2)
+    for (r in routes) {
+        counts[r.id] = (counts[r.id] ?: 0) + 1
+    }
+    val map = HashMap<Int, IntArray>(counts.size * 2)
+    val offsets = HashMap<Int, Int>(counts.size * 2)
+    for ((id, count) in counts) {
+        map[id] = IntArray(count)
+        offsets[id] = 0
+    }
+    for (i in routes.indices) {
+        val id = routes[i].id
+        val arr = map[id]!!
+        arr[offsets[id]!!] = i
+        offsets[id] = offsets[id]!! + 1
+    }
+    return map
 }
 
 /**

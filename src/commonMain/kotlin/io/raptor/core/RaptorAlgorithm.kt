@@ -471,9 +471,11 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             val idx = destinationIndices[di]
             if (blockedStop[idx]) continue
             val seed = arrivalTime - (egressSeconds?.get(di) ?: 0) - penaltyAtStop[idx]
-            val transfers = network.reverseTransferData[idx]
-            var t = 0
-            while (t < transfers.size) {
+            val reverse = network.reverseTransfers
+            val transfers = reverse.data
+            var t = reverse.start[idx]
+            val tEnd = reverse.start[idx + 1]
+            while (t < tEnd) {
                 val sourceStopIndex = transfers[t]
                 val walkTime = transfers[t + 1]
                 t += 2
@@ -486,7 +488,12 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
                     state.markStop(sourceStopIndex)
                 }
             }
-            for (sourceStopIndex in network.implicitTransferData[idx]) {
+            val group = network.implicitGroupOf[idx]
+            var m = network.implicitGroups.start[group]
+            val mEnd = network.implicitGroups.start[group + 1]
+            while (m < mEnd) {
+                val sourceStopIndex = network.implicitGroups.data[m++]
+                if (sourceStopIndex == idx) continue
                 if (blockedStop[sourceStopIndex]) continue
                 val dep = seed - 120 - penaltyAtStop[sourceStopIndex]
                 if (dep < earliestDeparture) continue
@@ -698,9 +705,11 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
 
             // Explicit INCOMING transfers: to walk source -> stopIndex and leave stopIndex at
             // departureTime, we must leave the source by departureTime - walkTime.
-            val transfers = network.reverseTransferData[stopIndex]
-            var t = 0
-            while (t < transfers.size) {
+            val reverse = network.reverseTransfers
+            val transfers = reverse.data
+            var t = reverse.start[stopIndex]
+            val tEnd = reverse.start[stopIndex + 1]
+            while (t < tEnd) {
                 val sourceStopIndex = transfers[t]
                 val walkTime = transfers[t + 1]
                 t += 2
@@ -716,8 +725,12 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             }
 
             // Implicit transfers: same-name stops, symmetric adjacency, 120s default transfer time
-            val implicitSources = network.implicitTransferData[stopIndex]
-            for (otherStopIndex in implicitSources) {
+            val group = network.implicitGroupOf[stopIndex]
+            var m = network.implicitGroups.start[group]
+            val mEnd = network.implicitGroups.start[group + 1]
+            while (m < mEnd) {
+                val otherStopIndex = network.implicitGroups.data[m++]
+                if (otherStopIndex == stopIndex) continue
                 if (blockedStop[otherStopIndex]) continue
                 val departureAtSource = departureTime - 120 - penaltyAtStop[otherStopIndex]
                 if (departureAtSource <= bestAtOrigin || departureAtSource < earliestDeparture) continue
@@ -741,9 +754,10 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             val arrivalTime = ba[roundOff + stopIndex]
 
             // Explicit transfers (pre-computed: [targetIdx, walkTime, targetIdx, walkTime, ...])
-            val transfers = network.transferData[stopIndex]
-            var t = 0
-            while (t < transfers.size) {
+            val transfers = network.transfers.data
+            var t = network.transfers.start[stopIndex]
+            val tEnd = network.transfers.start[stopIndex + 1]
+            while (t < tEnd) {
                 val targetStopIndex = transfers[t]
                 val walkTime = transfers[t + 1]
                 t += 2
@@ -765,8 +779,12 @@ class RaptorAlgorithm(private val network: Network, private val debug: Boolean =
             }
 
             // Implicit transfers: pre-computed same-name stops (default 120s transfer time)
-            val implicitTargets = network.implicitTransferData[stopIndex]
-            for (otherStopIndex in implicitTargets) {
+            val group = network.implicitGroupOf[stopIndex]
+            var m = network.implicitGroups.start[group]
+            val mEnd = network.implicitGroups.start[group + 1]
+            while (m < mEnd) {
+                val otherStopIndex = network.implicitGroups.data[m++]
+                if (otherStopIndex == stopIndex) continue
                 if (blockedStop[otherStopIndex]) continue
                 // 2 minutes default transfer time, plus whatever the stop is currently costing
                 val arrivalAtTarget = arrivalTime + 120 + penaltyAtStop[otherStopIndex]

@@ -30,24 +30,54 @@ object NetworkLoader {
     private fun loadStopsV1(reader: BinaryReader): List<Stop> {
         reader.readMagic("RSTS")
         reader.readUInt16()
-        val count = reader.readUInt32()
+        return readStops(reader, reader.readUInt32(), hasZone = false)
+    }
 
-        return List(count) {
-            val id = reader.readUInt32()
-            val nameLen = reader.readUInt16()
-            val name = reader.readUTF8(nameLen)
-            val lat = reader.readFloat64()
-            val lon = reader.readFloat64()
-
-            val routeRefCount = reader.readUInt32()
-            val routeIds = IntArray(routeRefCount) { reader.readUInt32() }
-
-            val transferCount = reader.readUInt32()
-            val transfers = List(transferCount) {
-                Transfer(targetStopId = reader.readUInt32(), walkTime = reader.readInt32())
+    /**
+     * The stop records of every stops format (V1 is V2 without the zone field). Built for a
+     * small heap: every transfer of the file goes into one shared array of (target, walk) pairs
+     * that each stop's [Stop.transfers] reads through (no object per transfer), stops with no
+     * route share one empty array, and a name or zone repeated across stops is kept once.
+     */
+    private fun readStops(reader: BinaryReader, count: Int, hasZone: Boolean): List<Stop> {
+        val ids = IntArray(count)
+        val names = arrayOfNulls<String>(count)
+        val lats = DoubleArray(count)
+        val lons = DoubleArray(count)
+        val zones = arrayOfNulls<String>(count)
+        val routeIds = arrayOfNulls<IntArray>(count)
+        val transferStart = IntArray(count + 1)
+        var pairs = IntArray(maxOf(16, count * 8))
+        var used = 0
+        val strings = HashMap<String, String>()
+        for (i in 0 until count) {
+            ids[i] = reader.readUInt32()
+            val name = reader.readUTF8(reader.readUInt16())
+            names[i] = strings.getOrPut(name) { name }
+            lats[i] = reader.readFloat64()
+            lons[i] = reader.readFloat64()
+            if (hasZone) {
+                val zone = reader.readUTF8(reader.readUInt16())
+                zones[i] = if (zone.isEmpty()) null else strings.getOrPut(zone) { zone }
             }
-
-            Stop(id, name, lat, lon, routeIds, transfers)
+            val routeRefCount = reader.readUInt32()
+            routeIds[i] = if (routeRefCount == 0) EMPTY_INTS else IntArray(routeRefCount) { reader.readUInt32() }
+            val transferCount = reader.readUInt32()
+            transferStart[i] = used
+            if (used + 2 * transferCount > pairs.size) {
+                pairs = pairs.copyOf(maxOf(pairs.size * 2, used + 2 * transferCount))
+            }
+            repeat(transferCount) {
+                pairs[used++] = reader.readUInt32()
+                pairs[used++] = reader.readInt32()
+            }
+        }
+        transferStart[count] = used
+        val flat = if (used == pairs.size) pairs else pairs.copyOf(used)
+        return List(count) { i ->
+            val n = (transferStart[i + 1] - transferStart[i]) / 2
+            val transfers: List<Transfer> = if (n == 0) emptyList() else FlatTransferList(flat, transferStart[i], n)
+            Stop(ids[i], names[i]!!, lats[i], lons[i], routeIds[i]!!, transfers, zones[i])
         }
     }
 
@@ -104,37 +134,19 @@ object NetworkLoader {
     private fun loadStopsFlat(reader: BinaryReader, magic: String, hasZone: Boolean): List<Stop> {
         reader.readMagic(magic)
         reader.readUInt16() // version
-        val count = reader.readUInt32()
-
-        return List(count) {
-            val id = reader.readUInt32()
-            val nameLen = reader.readUInt16()
-            val name = reader.readUTF8(nameLen)
-            val lat = reader.readFloat64()
-            val lon = reader.readFloat64()
-            val zone = if (hasZone) reader.readUTF8(reader.readUInt16()).ifEmpty { null } else null
-
-            val routeRefCount = reader.readUInt32()
-            val routeIds = IntArray(routeRefCount) { reader.readUInt32() }
-
-            val transferCount = reader.readUInt32()
-            val transfers = List(transferCount) {
-                Transfer(targetStopId = reader.readUInt32(), walkTime = reader.readInt32())
-            }
-
-            Stop(id, name, lat, lon, routeIds, transfers, zone)
-        }
+        return readStops(reader, reader.readUInt32(), hasZone)
     }
 
     private fun loadRoutesV2(reader: BinaryReader): List<Route> {
         reader.readMagic("RRT2")
         reader.readUInt16() // version
         val count = reader.readUInt32()
+        val names = HashMap<String, String>()  // a line name shared by its directions and patterns is kept once
 
         return List(count) {
             val routeId = reader.readUInt32()
             val nameLen = reader.readUInt16()
-            val name = reader.readUTF8(nameLen)
+            val name = reader.readUTF8(nameLen).let { names.getOrPut(it) { it } }
             val stopCount = reader.readUInt32()
             val tripCount = reader.readUInt32()
             val stopIds = IntArray(stopCount) { reader.readUInt32() }

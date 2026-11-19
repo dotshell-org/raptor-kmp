@@ -21,6 +21,28 @@ data class Transfer(
     val walkTime: Int      // Walking time in seconds
 )
 
+/** Shared by every stop with no route, instead of one empty array each. */
+internal val EMPTY_INTS = IntArray(0)
+
+/**
+ * The transfers of one stop as [NetworkLoader] reads them: a window of `size` (target id, walk
+ * time) pairs in one array shared by every stop of the file, starting at int [start]. A
+ * [Transfer] is made only when an element is asked for, so a loaded network holds two ints per
+ * transfer instead of an object each (plus a list per stop), and [Network] can route on the
+ * shared array as it is.
+ */
+internal class FlatTransferList(
+    internal val pairs: IntArray,
+    internal val start: Int,
+    override val size: Int
+) : AbstractList<Transfer>() {
+    override fun get(index: Int): Transfer {
+        if (index < 0 || index >= size) throw IndexOutOfBoundsException("index $index, size $size")
+        val at = start + 2 * index
+        return Transfer(pairs[at], pairs[at + 1])
+    }
+}
+
 /**
  * Represents a transit route (a line with a specific sequence of stops).
  * (`@JvmField` was removed for Kotlin Multiplatform — it is JVM-only and not available in
