@@ -59,6 +59,9 @@ class RaptorState(val network: Network, val maxRounds: Int) {
         const val P_DATA = 2
         const val P_POS = 3
         const val PARENT_STRIDE = 4
+        private const val SAVED_STRIDE = 7
+        /** A journey holds at most a ride and a walk per round: well past that, a rebuild has gone round in circles. */
+        private const val WALK_STEPS_GUARD = 2
     }
 
     // Boolean arrays for O(1) mark checks (var: swapped in clearMarks to avoid O(stopCount) copies)
@@ -90,6 +93,8 @@ class RaptorState(val network: Network, val maxRounds: Int) {
         markedStopsPrevious.fill(false)
         markedSize = 0
         markedSizePrev = 0
+        savedCount = 0
+        bestRide.fill(Int.MAX_VALUE)
     }
 
     fun markStop(stopIndex: Int) {
@@ -187,6 +192,59 @@ class RaptorState(val network: Network, val maxRounds: Int) {
         }
     }
 
+    /** Per stop, the earliest arrival by a ride in any round so far: where walks leave from. */
+    val bestRide: IntArray = IntArray(stopCount).also { it.fill(Int.MAX_VALUE) }
+
+    // Rides walks may leave from that are not (or no longer) a stop's label: rides later than its
+    // label, and ride labels a walk of the same round replaced. Entries of SAVED_STRIDE ints
+    // (round, stop, the 4 parent fields, the arrival); a walk's departure time tells which ride it
+    // left from.
+    private var savedRides = IntArray(SAVED_STRIDE * 16)
+    private var savedCount = 0
+
+    private fun saveEntry(round: Int, stopIndex: Int, pStop: Int, pRoute: Int, pData: Int, pPos: Int, arrival: Int) {
+        if (savedCount * SAVED_STRIDE == savedRides.size) savedRides = savedRides.copyOf(savedRides.size * 2)
+        val s = savedCount++ * SAVED_STRIDE
+        savedRides[s] = round; savedRides[s + 1] = stopIndex
+        savedRides[s + 2] = pStop; savedRides[s + 3] = pRoute; savedRides[s + 4] = pData; savedRides[s + 5] = pPos
+        savedRides[s + 6] = arrival
+    }
+
+    /** The stop the walk labelling [stopIndex] in [round] comes from, or -1 when that label is no walk of that round. */
+    fun walkSourceAt(round: Int, stopIndex: Int): Int {
+        val base = (round * stopCount + stopIndex) * PARENT_STRIDE
+        return if (parentData[base + P_ROUTE] == -1) parentData[base + P_STOP] else -1
+    }
+
+    /** A ride into [stopIndex] at [arrival] that improves its best ride but not its label. */
+    fun saveRide(round: Int, stopIndex: Int, boardingStop: Int, routeIdx: Int, tripIdx: Int, boardingPos: Int,
+                 alightingPos: Int, arrival: Int) {
+        if (round > lastMaxRound) lastMaxRound = round
+        saveEntry(round, stopIndex, boardingStop, routeIdx, tripIdx, (boardingPos shl 16) or (alightingPos and 0xFFFF), arrival)
+    }
+
+    /**
+     * Labels [stopIndex] in [round] with a walk from [fromStop], left at [departure] and arriving
+     * at [arrival]. A ride label of this round it replaces is kept aside, see [savedRides].
+     */
+    fun setWalk(round: Int, stopIndex: Int, fromStop: Int, departure: Int, arrival: Int) {
+        val base = (round * stopCount + stopIndex) * PARENT_STRIDE
+        if (parentData[base + P_STOP] != -1 && parentData[base + P_ROUTE] != -1) {
+            saveEntry(round, stopIndex, parentData[base + P_STOP], parentData[base + P_ROUTE], parentData[base + P_DATA],
+                parentData[base + P_POS], bestArrival[round * stopCount + stopIndex])
+        }
+        bestArrival[round * stopCount + stopIndex] = arrival
+        setParent(round, stopIndex, fromStop, round, -1, departure, -1, -1, -1)
+    }
+
+    private fun savedLabelAt(round: Int, stopIndex: Int, arrival: Int): Int {
+        for (i in savedCount - 1 downTo 0) {
+            val s = i * SAVED_STRIDE
+            if (savedRides[s] == round && savedRides[s + 1] == stopIndex && savedRides[s + 6] == arrival) return s
+        }
+        return -1
+    }
+
     fun reconstructJourney(destinationIndex: Int, round: Int? = null): List<JourneyLeg> {
         val legs = mutableListOf<JourneyLeg>()
         var currentRound = round ?: getBestRound(destinationIndex)
@@ -196,23 +254,36 @@ class RaptorState(val network: Network, val maxRounds: Int) {
             return emptyList()
         }
 
+        // When the leg found last is a walk, the time it left this stop: the label it left from.
+        var leftAt = -1
+        var steps = 0
         // Reconstruct backwards from destination
         while (currentRound > 0 && currentStop >= 0) {
-            val base = (currentRound * stopCount + currentStop) * PARENT_STRIDE
-            val pStop = parentData[base + P_STOP]
+            var data = parentData
+            var base = (currentRound * stopCount + currentStop) * PARENT_STRIDE
+            var arrival = bestArrival[currentRound * stopCount + currentStop]
+            // Walks leave from rides. A ride later than the stop's label, or a ride label a walk
+            // replaced since, is kept aside, found by the time the walk left. (Preferred even when
+            // the label has that same time: a ride never leads back into the same round's walks.)
+            if (leftAt != -1) {
+                val s = savedLabelAt(currentRound, currentStop, leftAt)
+                if (s != -1) { data = savedRides; base = s + 2; arrival = leftAt }
+            }
+            if (++steps > 4 * (maxRounds + 1) * (WALK_STEPS_GUARD)) break
+            val pStop = data[base + P_STOP]
             if (pStop == -1) break
 
-            val pRouteInternalIdx = parentData[base + P_ROUTE]
+            val pRouteInternalIdx = data[base + P_ROUTE]
             val ride = pRouteInternalIdx != -1
             val pRound = if (ride) currentRound - 1 else currentRound
-            val pTripIdx = if (ride) parentData[base + P_DATA] else -1
-            val positions = parentData[base + P_POS]
+            val pTripIdx = if (ride) data[base + P_DATA] else -1
+            val positions = data[base + P_POS]
             val pBoardingPos = if (ride) positions ushr 16 else -1
             val pAlightingPos = if (ride) positions and 0xFFFF else -1
             val pDepTime = if (ride) {
                 val route = network.routeList[pRouteInternalIdx]
                 route.flatStopTimes[pTripIdx * route.stopCountInRoute + pBoardingPos]
-            } else parentData[base + P_DATA]
+            } else data[base + P_DATA]
 
             val intermediateStopIndices = mutableListOf<Int>()
             val intermediateArrivalTimes = mutableListOf<Int>()
@@ -247,7 +318,7 @@ class RaptorState(val network: Network, val maxRounds: Int) {
                     fromStopIndex = pStop,
                     toStopIndex = currentStop,
                     departureTime = pDepTime,
-                    arrivalTime = bestArrival[currentRound * stopCount + currentStop],
+                    arrivalTime = arrival,
                     routeName = routeName,
                     isTransfer = routeName == null,
                     intermediateStopIndices = intermediateStopIndices,
@@ -259,6 +330,7 @@ class RaptorState(val network: Network, val maxRounds: Int) {
             // Move to the parent stop and round
             currentStop = pStop
             currentRound = pRound
+            leftAt = if (ride) -1 else pDepTime
         }
 
         return legs.reversed()
@@ -283,6 +355,9 @@ class BackwardRaptorState(network: Network, val maxRounds: Int) {
     // Int.MIN_VALUE represents "cannot reach a destination in time from here"
     val latestDeparture: IntArray = IntArray((maxRounds + 1) * stopCount).also { it.fill(Int.MIN_VALUE) }
 
+    /** Per stop, the latest departure by a ride in any round so far: what walks into it aim at. */
+    val latestRide: IntArray = IntArray(stopCount).also { it.fill(Int.MIN_VALUE) }
+
     private var markedStops = BooleanArray(stopCount)
     private var markedStopsPrevious = BooleanArray(stopCount)
     private var markedArray = IntArray(256)
@@ -295,6 +370,7 @@ class BackwardRaptorState(network: Network, val maxRounds: Int) {
 
     fun reset() {
         latestDeparture.fill(Int.MIN_VALUE, 0, (lastRound + 1) * stopCount)
+        latestRide.fill(Int.MIN_VALUE)
         lastRound = 0
         // Set bits are exactly the entries listed in the mark arrays: clear incrementally
         for (i in 0 until markedSize) markedStops[markedArray[i]] = false
