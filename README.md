@@ -10,7 +10,7 @@ Add to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("eu.dotshell:raptor-kmp:2.4.0")
+    implementation("eu.dotshell:raptor-kmp:2.4.1")
 }
 ```
 
@@ -103,6 +103,17 @@ both modes the files' bytes are let go as soon as a period's network is built.
 Since 2.4.0 the network itself is held in flat arrays: on a whole-France network (313 419 stops,
 489 575 trips) the heap after loading went from 275 MB to 124 MB, and the smallest JVM heap that
 loads it and runs searches from 384 MB to 224 MB, with identical journeys.
+
+### Transfers (v2.4.1)
+
+Between two rides a journey walks at most once, from the stop where the first ride arrived, as
+in the RAPTOR paper. Before 2.4.1, the result depended on how the routes happened to be
+numbered: a stop reached on foot could pass its walk on to a second walk, or hide a later ride
+to the same stop that a better walk could have left from. The same network under other route
+numbers then gave other journeys (3 in 1,000 on a whole-France network).
+
+Journeys are now the same whatever the numbering. A few that relied on two walks in a row arrive
+later (20 to 39 in 2,000 searches on france-live), and searches take about 15 % longer.
 
 ### Arrive-By Search
 
